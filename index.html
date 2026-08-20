@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>彩糖消消乐</title>
+  <style>
+    :root { --cell: 58px; --gap: 5px; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; min-height: 100vh; display: grid; place-items: center;
+      font-family: "Microsoft YaHei", system-ui, sans-serif;
+      color: #fff; background: radial-gradient(circle at top, #6658b8, #1d1745 72%);
+    }
+    .game { width: min(94vw, 440px); text-align: center; padding: 22px; }
+    h1 { margin: 0 0 6px; font-size: 30px; }
+    .hint { margin: 0 0 16px; opacity: .88; font-size: 14px; }
+    .panel { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+    .score { font-size: 18px; font-weight: bold; }
+    button.control {
+      border: 0; border-radius: 10px; padding: 9px 13px; cursor: pointer;
+      color: #342667; background: #fff; font: inherit; font-weight: bold;
+    }
+    #board {
+      display: grid; grid-template-columns: repeat(6, var(--cell)); gap: var(--gap);
+      justify-content: center; padding: 12px; border-radius: 18px;
+      background: rgba(255,255,255,.17); box-shadow: 0 12px 30px rgba(0,0,0,.25);
+    }
+    .tile {
+      width: var(--cell); height: var(--cell); border: 0; border-radius: 15px;
+      cursor: pointer; transition: transform .16s, outline .16s, opacity .18s;
+      box-shadow: inset 0 -6px rgba(0,0,0,.14), inset 0 4px rgba(255,255,255,.32);
+    }
+    .tile:hover { transform: scale(1.06); }
+    .tile.selected { outline: 4px solid #fff; transform: scale(.91); }
+    .tile.removing { transform: scale(.15); opacity: 0; }
+    .red { background: #ff5f72; } .blue { background: #4fa7ff; }
+    .yellow { background: #ffd84e; } .green { background: #53d58c; }
+    .purple { background: #b37aff; }
+    .message { height: 24px; margin: 13px 0 0; font-weight: bold; color: #fff4a8; }
+    @media (max-width: 410px) { :root { --cell: 48px; --gap: 4px; } }
+  </style>
+</head>
+<body>
+  <main class="game">
+    <h1>彩糖消消乐</h1>
+    <p class="hint">按住彩糖并拖到相邻位置，连成三个或更多即可消除！</p>
+    <div class="panel">
+      <div class="score">得分：<span id="score">0</span></div>
+      <button class="control" id="restart">重新开始</button>
+    </div>
+    <div id="board" aria-label="游戏棋盘"></div>
+    <p id="message" class="message"></p>
+  </main>
+
+  <script>
+    const SIZE = 6;
+    const COLORS = ["red", "blue", "yellow", "green", "purple"];
+    const boardElement = document.querySelector("#board");
+    const scoreElement = document.querySelector("#score");
+    const messageElement = document.querySelector("#message");
+    let board = [];
+    let selected = null;
+    let score = 0;
+    let busy = false;
+    let dragStart = null;
+    let audioContext = null;
+
+    const wait = (milliseconds) => new Promise(resolve => setTimeout(resolve, milliseconds));
+    const randomColor = () => COLORS[Math.floor(Math.random() * COLORS.length)];
+
+    function playNotes(notes, duration = 0.09) {
+      const AudioEngine = window.AudioContext || window.webkitAudioContext;
+      if (!AudioEngine) return;
+      audioContext ??= new AudioEngine();
+      audioContext.resume();
+      const now = audioContext.currentTime;
+      notes.forEach((frequency, index) => {
+        const oscillator = audioContext.createOscillator();
+        const volume = audioContext.createGain();
+        const start = now + index * duration;
+        oscillator.type = "sine";
+        oscillator.frequency.value = frequency;
+        volume.gain.setValueAtTime(0.0001, start);
+        volume.gain.exponentialRampToValueAtTime(0.13, start + 0.01);
+        volume.gain.exponentialRampToValueAtTime(0.0001, start + duration);
+        oscillator.connect(volume).connect(audioContext.destination);
+        oscillator.start(start);
+        oscillator.stop(start + duration + 0.02);
+      });
+    }
+
+    function makeBoard() {
+      board = Array.from({ length: SIZE }, () => Array(SIZE).fill(null));
+      for (let row = 0; row < SIZE; row++) {
+        for (let col = 0; col < SIZE; col++) {
+          do { board[row][col] = randomColor(); }
+          while (wouldMakeMatch(row, col));
+        }
+      }
+    }
+
+    function wouldMakeMatch(row, col) {
+      const color = board[row][col];
+      return (col >= 2 && board[row][col - 1] === color && board[row][col - 2] === color) ||
+             (row >= 2 && board[row - 1][col] === color && board[row - 2][col] === color);
+    }
+
+    function render(removing = new Set()) {
+      boardElement.innerHTML = "";
+      board.forEach((row, rowIndex) => row.forEach((color, colIndex) => {
+        const tile = document.createElement("button");
+        const key = `${rowIndex},${colIndex}`;
+        tile.className = `tile ${color || ""}`;
+        if (selected && selected.row === rowIndex && selected.col === colIndex) tile.classList.add("selected");
+        if (removing.has(key)) tile.classList.add("removing");
+        tile.dataset.row = rowIndex;
+        tile.dataset.col = colIndex;
+        tile.setAttribute("aria-label", `第 ${rowIndex + 1} 行第 ${colIndex + 1} 列`);
+        boardElement.append(tile);
+      }));
+      scoreElement.textContent = score;
+    }
+
+    function areAdjacent(first, second) {
+      return Math.abs(first.row - second.row) + Math.abs(first.col - second.col) === 1;
+    }
+
+    async function trySwap(first, clicked) {
+      if (busy) return;
+      if (!areAdjacent(first, clicked)) {
+        messageElement.textContent = "请拖到相邻的彩糖上。";
+        playNotes([180], 0.12);
+        return;
+      }
+
+      busy = true;
+      playNotes([440], 0.07);
+      swap(first, clicked);
+      render();
+      await wait(180);
+      if (findMatches().size === 0) {
+        swap(first, clicked);
+        messageElement.textContent = "这次交换不能消除，换一个试试。";
+        playNotes([190, 150], 0.1);
+        render();
+        busy = false;
+        return;
+      }
+      await resolveMatches();
+      messageElement.textContent = "做得好！继续消除吧。";
+      busy = false;
+    }
+
+    function swap(first, second) {
+      [board[first.row][first.col], board[second.row][second.col]] =
+        [board[second.row][second.col], board[first.row][first.col]];
+    }
+
+    function findMatches() {
+      const matches = new Set();
+      for (let row = 0; row < SIZE; row++) {
+        let start = 0;
+        for (let col = 1; col <= SIZE; col++) {
+          if (col < SIZE && board[row][col] === board[row][start]) continue;
+          if (board[row][start] && col - start >= 3) {
+            for (let index = start; index < col; index++) matches.add(`${row},${index}`);
+          }
+          start = col;
+        }
+      }
+      for (let col = 0; col < SIZE; col++) {
+        let start = 0;
+        for (let row = 1; row <= SIZE; row++) {
+          if (row < SIZE && board[row][col] === board[start][col]) continue;
+          if (board[start][col] && row - start >= 3) {
+            for (let index = start; index < row; index++) matches.add(`${index},${col}`);
+          }
+          start = row;
+        }
+      }
+      return matches;
+    }
+
+    async function resolveMatches() {
+      let matches = findMatches();
+      while (matches.size > 0) {
+        score += matches.size * 10;
+        playNotes([523, 659, 784], 0.07);
+        render(matches);
+        await wait(200);
+        matches.forEach(key => {
+          const [row, col] = key.split(",").map(Number);
+          board[row][col] = null;
+        });
+        dropTiles();
+        render();
+        await wait(220);
+        matches = findMatches();
+      }
+      render();
+    }
+
+    function dropTiles() {
+      for (let col = 0; col < SIZE; col++) {
+        const colors = [];
+        for (let row = SIZE - 1; row >= 0; row--) if (board[row][col]) colors.push(board[row][col]);
+        for (let row = SIZE - 1; row >= 0; row--) board[row][col] = colors.shift() || randomColor();
+      }
+    }
+
+    function startGame() {
+      score = 0;
+      selected = null;
+      dragStart = null;
+      busy = false;
+      makeBoard();
+      messageElement.textContent = "开始游戏！";
+      render();
+    }
+
+    boardElement.addEventListener("pointerdown", event => {
+      const tile = event.target.closest(".tile");
+      if (!tile || busy) return;
+      dragStart = { row: Number(tile.dataset.row), col: Number(tile.dataset.col) };
+      boardElement.setPointerCapture(event.pointerId);
+      tile.classList.add("selected");
+      event.preventDefault();
+    });
+
+    boardElement.addEventListener("pointerup", event => {
+      if (!dragStart) return;
+      const start = dragStart;
+      dragStart = null;
+      if (boardElement.hasPointerCapture(event.pointerId)) boardElement.releasePointerCapture(event.pointerId);
+      const endTile = document.elementFromPoint(event.clientX, event.clientY)?.closest(".tile");
+      document.querySelectorAll(".tile.selected").forEach(tile => tile.classList.remove("selected"));
+      if (!endTile) return;
+      trySwap(start, { row: Number(endTile.dataset.row), col: Number(endTile.dataset.col) });
+    });
+
+    boardElement.addEventListener("pointercancel", () => { dragStart = null; });
+    document.querySelector("#restart").addEventListener("click", () => {
+      playNotes([392, 523, 659], 0.08);
+      startGame();
+    });
+    startGame();
+  </script>
+</body>
+</html>
